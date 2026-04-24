@@ -1,0 +1,46 @@
+# Example defectset config.
+#
+# defectset pipeline:
+#   1. Run `defectool generate` then `defectool relax` on `defectool_config`.
+#   2. Read the defectool ASE database.
+#   3. Apply filters (see below).
+#   4. Run a single-point QE SCF on each surviving structure.
+#   5. Write an extxyz dataset with REF_energy and REF_forces.
+
+defectool_config: ./bn_vacancy.yaml
+
+filters:
+  min_pair_distance_factor: 0.7       # fraction of (r_cov_i + r_cov_j)
+  max_energy_per_atom_above_min: 2.0  # eV/atom above batch min (MLIP energy)
+  max_displacement: 3.0               # A from the converged `undistorted` ref; null to skip
+  require_converged: true
+
+qe:
+  pseudopotentials:
+    B: B.upf
+    N: N.upf
+  pseudo_dir: /abs/path/to/pseudo      # absolute path; resolved at launch
+  command: "mpirun -np 4 pw.x"         # e.g. "pw.x", "mpirun -np 8 pw.x", "srun pw.x"
+  ecutwfc: 80.0
+  # ecutrho: 640.0                     # optional; default is 4 * ecutwfc
+  # kpoints: [2, 2, 2]                 # either explicit grid...
+  kspacing: 0.04                       # ...or reciprocal-space spacing (A^-1)
+  smearing: cold
+  degauss: 0.01
+  spin_polarized: false
+  mixing_beta: 0.3
+  electron_maxstep: 200
+  conv_thr: 1.0e-8
+
+  # Anything extra, deep-merged into the QE namelists. Examples:
+  # extra_input_data:
+  #   system:
+  #     tot_charge: -1
+  #     nbnd: 60
+  #   electrons:
+  #     diagonalization: cg
+
+output:
+  dataset_path: defect_dataset.extxyz
+  rejected_path: defect_rejected.extxyz
+  log_path: defectset.log

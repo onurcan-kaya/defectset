@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "defectset"
+version = "0.1.0"
+description = "Turn defectool-generated defect structures into DFT-labelled datasets for MLIP training, with an MLIP pre-filter to skip broken geometries before QE."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Onurcan Kaya"}]
+keywords = ["defects", "mlip", "dft", "materials", "dataset"]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Chemistry",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+dependencies = [
+    "ase>=3.23",
+    "numpy",
+    "pyyaml",
+    "click",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff"]
+
+[project.scripts]
+defectset = "defectset.cli:cli"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["defectset*"]
