@@ -1,69 +1,86 @@
 # defectset
 
-Close the loop from [`defectool`](https://github.com/onurcan-kaya/defectool)-generated defect structures to a DFT-labelled training set.
+Takes defect structures from [`defectool`](https://github.com/onurcan-kaya/defectool), filters out the junk, runs Quantum ESPRESSO single-point SCFs on what survives, and writes an extxyz dataset with DFT energies and forces. You get a training set for MLIPs without wasting QE time on structures the MLIP mangled.
 
-`defectset` runs `defectool` (MLIP-based distort → rattle → relax), filters out the broken geometries the MLIP produced, runs a single-point Quantum ESPRESSO SCF on each survivor, and writes an `extxyz` dataset with DFT energies and forces. The MLIP pre-filter is the point: structures that an MLIP collapses, fails to converge on, or relaxes into some bizarre basin are exactly the ones that would waste hours of QE wall-time and produce low-quality labels.
-
-## What it does
+## Pipeline
 
 ```
-defectool yaml
-      │
-      ├── defectool generate   (build defect supercells + distortions + rattles)
-      ├── defectool relax      (MLIP relaxation, default MACE-MP-0 via ASE)
-      │
-      ▼
-defectool.db  ──►  filter  ──►  QE single-point  ──►  extxyz with REF_energy/REF_forces
-                     │
-                     └── rejected.extxyz (reason logged per structure)
+defectool generate + relax
+            |
+            v
+      defectool.db
+            |
+      [stage 1 filters]  -- per-structure: convergence, pair distance
+            |
+      [stage 2 filters]  -- batch-relative: energy/atom, displacement
+            |
+      QE single-point SCF (cached per label)
+            |
+    +-------+-------+
+    |               |
+    v               v
+defect_dataset    defect_rejected
+  .extxyz           .extxyz
 ```
 
-Four filters run before QE:
+`defectset` shells out to `defectool generate` then `defectool relax` (unless you pass `--skip-defectool`), reads the resulting ASE database, applies filters in two stages, runs `pw.x` on each survivor, and writes the output.
 
-| Filter | Rejects |
-|---|---|
-| `require_converged` | structures defectool marked `is_converged=False` (force divergence, >max_steps, etc.) |
-| `min_pair_distance_factor` | pairs closer than `factor × (r_cov_i + r_cov_j)` — catches MLIP atom collapses |
-| `max_energy_per_atom_above_min` | structures with MLIP energy per atom more than X eV above the batch minimum |
-| `max_displacement` | atoms displaced more than X Å (MIC) from the converged `undistorted` reference |
+## Filters
 
-All thresholds are configurable. Each reject is written to `defect_rejected.extxyz` with a `reject_reason` in the info dict so you can audit.
+Filters run in order. A structure rejected in stage 1 never reaches stage 2.
 
-QE calculations are cached per label in `<work_dir>/qe_cache/`. Re-running the pipeline reuses successful QE outputs; failed ones are re-attempted.
+**Stage 1 -- per-structure:**
+
+- `require_converged` (default: true) -- rejects anything defectool marked `is_converged=False`.
+- `min_pair_distance_factor` (default: 0.7) -- rejects if any pair distance is less than `factor * (r_cov_i + r_cov_j)`, using ASE covalent radii and MIC distances. Catches MLIP atom collapses.
+
+**Stage 2 -- batch-relative (runs on stage 1 survivors only):**
+
+- `max_energy_per_atom_above_min` (default: 2.0 eV/atom) -- computes MLIP energy/atom for all stage 1 survivors, finds the minimum, rejects anything more than X eV/atom above it.
+- `max_displacement` (default: 3.0 Ang) -- computes MIC displacement of each atom from the converged `undistorted` structure in the DB. Rejects if any atom moved more than X Ang. If there is no converged `undistorted` entry in the DB, this filter is skipped (warning in log). Set to `null` to disable.
+
+Every reject is written to `defect_rejected.extxyz` with a `reject_reason` string in the info dict.
+
+## QE caching
+
+QE results are cached in `<work_dir>/qe_cache/<label>.extxyz`. Re-running the pipeline skips any label that already has a cached result. Failed QE runs are not cached, so they get retried.
+
+**Watch out:** the cache key is the defectool `label` string. If your defectool config produces duplicate labels, the second structure with the same label will read the first one's cached result. This is a real problem if you have multiple defect types producing identically-named distortions.
 
 ## Prerequisites
 
-- **Python ≥ 3.10**
-- **ASE ≥ 3.23** (installed automatically as a dependency). `defectset` uses ASE's `EspressoProfile` API, which requires ASE 3.23+. It does **not** use the legacy `ASE_ESPRESSO_COMMAND` env var or `~/.config/ase/config.ini`.
-- **[`defectool`](https://github.com/onurcan-kaya/defectool)** on your `PATH`. `defectset` invokes it via the `defectool` CLI. Install with:
-  ```bash
-  git clone https://github.com/onurcan-kaya/defectool.git
-  cd defectool && pip install -e ".[mace]"
-  ```
-  Install defectool and defectset into the **same** Python environment, otherwise the `defectool` command will not be found when `defectset` shells out.
-- **An MLIP calculator usable by defectool.** The default is MACE-MP-0, pulled in by the `[mace]` extra above. Any defectool-supported calculator works — the pre-filter quality just depends on how well it relaxes your defects.
-- **Quantum ESPRESSO `pw.x`** on your `PATH`, and pseudopotentials for every element in your system. The path to pseudos goes into `qe.pseudo_dir` in the defectset config; the launch command goes into `qe.command`.
+- Python >= 3.10
+- ASE >= 3.23 (installed as a dependency). The code uses `EspressoProfile` directly -- it does not use `ASE_ESPRESSO_COMMAND` or `~/.config/ase/config.ini`.
+- [`defectool`](https://github.com/onurcan-kaya/defectool) on your PATH. Not on PyPI, install it yourself:
 
-`defectset` is intentionally local-only: no scheduler integration, no job arrays. One `pw.x` SCF per structure, run in-process. Wrap it in your own batch script if you need parallel labelling.
+```
+git clone https://github.com/onurcan-kaya/defectool.git
+cd defectool && pip install -e ".[mace]"
+```
+
+Must be in the same Python environment as defectset, otherwise the subprocess call to `defectool` will not find it.
+
+- Quantum ESPRESSO `pw.x` on your PATH.
+- Pseudopotentials for every element in your system.
+
+No scheduler integration. One `pw.x` call at a time, in-process. Wrap it yourself if you need parallelism.
 
 ## Install
 
-```bash
-git clone <this-repo> defectset
+```
+git clone https://github.com/onurcan-kaya/defectset.git
 cd defectset
 pip install -e .
 ```
-
-`defectool` is **not** declared as a Python dependency because it is not on PyPI. Install it yourself as above, and make sure `which defectool` resolves.
 
 ## Usage
 
 ### CLI
 
-```bash
-defectset run config.yaml
-defectset run config.yaml --work-dir ./my_run
-defectset run config.yaml --skip-defectool    # reuse existing defectool.db
+```
+defectset run config.yaml                       # work dir defaults to ./defectset_work
+defectset run config.yaml --work-dir ./my_run   # custom work dir
+defectset run config.yaml --skip-defectool      # reuse existing defectool.db
 ```
 
 ### Python
@@ -74,85 +91,81 @@ from defectset import Config, run_pipeline
 
 cfg = Config.from_yaml("config.yaml")
 counts = run_pipeline(cfg, work_dir=Path("my_run"))
-# counts -> {"success": N, "qe_failed": M, "filtered": K}
+# counts = {"success": N, "qe_failed": M, "filtered": K}
 ```
 
-## Config reference
+## Config
 
-The config is a YAML file with four sections: `defectool_config`, `filters`, `qe`, `output`. Only `defectool_config` and `qe` are required. See [`example_config.yaml`](./example_config.yaml) for an annotated template.
+YAML with four sections. Only `defectool_config` and `qe` are required. Full annotated example in [`example_config.yaml`](example_config.yaml).
 
 ### `defectool_config`
-Path to an existing defectool YAML. `defectset` reads its `output_dir` to find the resulting `defectool.db`. Defaults match defectool (`defectool_output/`).
+
+Path to an existing defectool YAML. `defectset` reads that file's `output_dir` field to locate `defectool.db`. If the defectool YAML has no `output_dir`, it defaults to `defectool_output/`.
 
 ### `filters`
 
-| Key | Default | Meaning |
-|---|---|---|
-| `min_pair_distance_factor` | `0.7` | Reject if any pair distance < `factor × (r_cov_i + r_cov_j)` |
-| `max_energy_per_atom_above_min` | `2.0` | eV/atom above batch minimum MLIP energy |
-| `max_displacement` | `3.0` | Å from converged `undistorted` reference. `null` to skip |
-| `require_converged` | `true` | Require `is_converged=True` in defectool DB |
+| Key | Default | What it does |
+| --- | --- | --- |
+| `require_converged` | `true` | Reject `is_converged=False` |
+| `min_pair_distance_factor` | `0.7` | Reject if any pair < `factor * (r_cov_i + r_cov_j)` |
+| `max_energy_per_atom_above_min` | `2.0` | eV/atom above batch min MLIP energy |
+| `max_displacement` | `3.0` | Ang from converged `undistorted` ref. `null` to skip |
 
 ### `qe`
 
-| Key | Default | Meaning |
-|---|---|---|
-| `pseudopotentials` | **required** | Mapping `element: UPF filename` |
-| `pseudo_dir` | **required** | Directory containing UPFs. Use an absolute path |
-| `command` | `"pw.x"` | Full launch command. e.g. `"pw.x"`, `"mpirun -np 8 pw.x"`, `"srun pw.x"`. Parsed with `shlex` — no shell metacharacters expanded |
+| Key | Default | What it does |
+| --- | --- | --- |
+| `pseudopotentials` | required | Map of `element: UPF_filename` |
+| `pseudo_dir` | required | Absolute path to UPF directory |
+| `command` | `"pw.x"` | Launch command, parsed with `shlex`. Example: `"mpirun -np 8 pw.x"` |
 | `ecutwfc` | `80.0` | Ry |
-| `ecutrho` | `null` (= 4·ecutwfc) | Ry |
-| `kpoints` | `null` | Explicit `[nx, ny, nz]` (overrides kspacing) |
-| `kspacing` | `0.04` | Å⁻¹ |
+| `ecutrho` | `null` (= 4 * ecutwfc) | Ry |
+| `kpoints` | `null` | Explicit `[nx, ny, nz]`. Overrides kspacing |
+| `kspacing` | `0.04` | Reciprocal-space spacing in 1/Ang |
 | `smearing` | `cold` | QE smearing type |
 | `degauss` | `0.01` | Ry |
-| `spin_polarized` | `false` | Set `nspin=2` + small starting magnetisation |
+| `spin_polarized` | `false` | Sets `nspin=2` and `starting_magnetization(i)=0.1` for each unique element |
 | `mixing_beta` | `0.3` | |
 | `electron_maxstep` | `200` | |
 | `conv_thr` | `1.0e-8` | |
-| `extra_input_data` | `{}` | Deep-merged into QE namelists. Escape hatch for anything above |
+| `extra_input_data` | `{}` | Dict of dicts, deep-merged into QE namelists. E.g. `{system: {tot_charge: -1}}` |
 
 ### `output`
 
-| Key | Default | Meaning |
-|---|---|---|
-| `dataset_path` | `defect_dataset.extxyz` | Final DFT-labelled dataset |
-| `rejected_path` | `defect_rejected.extxyz` | All rejects (filtered + QE-failed) with `reject_reason` |
-| `log_path` | `defectset.log` | |
+| Key | Default |
+| --- | --- |
+| `dataset_path` | `defect_dataset.extxyz` |
+| `rejected_path` | `defect_rejected.extxyz` |
+| `log_path` | `defectset.log` |
 
-All output paths are resolved relative to `--work-dir`.
+All paths resolved relative to `--work-dir`.
 
 ## Output format
 
-`defect_dataset.extxyz` is extended XYZ. Each frame:
+Each frame in `defect_dataset.extxyz`:
 
-- `info["REF_energy"]` — DFT total energy (eV)
-- `arrays["REF_forces"]` — DFT forces (eV/Å, shape N×3)
-- `info["label"]` — defectool label (e.g. `bond_-0.02`, `rattle_3`, `undistorted`)
-- `info["defect_type"]`, `info["distortion_type"]`, `info["distortion_mag"]` — passthrough from defectool
-- `info["mlip_energy"]` — the MLIP total energy that defectool produced, for comparison
+- `info["REF_energy"]` -- DFT total energy in eV
+- `arrays["REF_forces"]` -- DFT forces in eV/Ang, shape (N, 3)
+- `info["label"]` -- defectool label, e.g. `bond_-0.02`, `rattle_3`, `undistorted`
+- `info["defect_type"]`, `info["distortion_type"]`, `info["distortion_mag"]` -- from defectool
+- `info["mlip_energy"]` -- MLIP total energy from defectool
 
-Compatible out of the box with MLIP training frameworks that auto-detect `REF_energy`/`REF_forces` keys (MACE, NequIP/Allegro, AutoMLIP).
+Works with MACE, NequIP/Allegro, and anything else that reads `REF_energy`/`REF_forces` keys.
 
-## Working directory layout
+Each frame in `defect_rejected.extxyz` has the same metadata plus `info["reject_reason"]`.
+
+## Work directory layout
 
 ```
 <work_dir>/
     defectset.log
-    defect_dataset.extxyz         # DFT-labelled survivors
-    defect_rejected.extxyz        # filtered + QE-failed, with reject_reason
-    qe/<label>/                   # raw pw.x working dirs (pwi, pwo, tmp/)
-    qe_cache/<label>.extxyz       # per-label successful QE result (used for restart)
+    defect_dataset.extxyz
+    defect_rejected.extxyz
+    qe/<label>/                   # pw.x working dirs (pwi, pwo, tmp/)
+    qe_cache/<label>.extxyz       # per-label cached QE result
 ```
 
-Delete `qe_cache/` to force re-labelling. Delete `qe/` to save space after the dataset is built.
-
-## Known limitations
-
-- **Neutral cells only by default.** `spin_polarized: true` works; for charged defects you need to set `tot_charge` via `extra_input_data.system` *and* accept that a naive plane-wave charged-cell energy needs a finite-size correction (FNV / eFNV) that this tool does not do. Use `doped` for that step.
-- **No parallel QE scheduling.** One SCF at a time, in-process. For >~50 structures, wrap `defectset run` calls in your own job script, or split the defectool output into chunks.
-- **Reference-based displacement filter assumes the `undistorted` label exists.** If you ran defectool with only distortions or rattles and no undistorted reference, this filter is silently skipped (warning in log). Set `max_displacement: null` to disable explicitly.
-- **MLIP pre-filter quality is only as good as the MLIP.** MACE-MP-0 is a reasonable default for main-group chemistries but misbehaves on charged, polaronic, or strongly correlated systems. Inspect `defect_rejected.extxyz` to audit.
+Delete `qe_cache/` to force re-labelling. Delete `qe/` to reclaim disk after the dataset is built.
 
 ## License
 
